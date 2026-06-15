@@ -13,6 +13,8 @@ from processor_type.interface import BackendInterface
 def left_canonicalize(tt: TTTensor, backend: BackendInterface) -> TTTensor:
     """
     Возвращает TTTensor — новый TT-тензор в лево-канонической форме.
+
+    Левая канонизация делается QR-разложением слева направо.
     """
     if tt.order == 1:
         return tt.copy()
@@ -26,33 +28,27 @@ def left_canonicalize(tt: TTTensor, backend: BackendInterface) -> TTTensor:
 
         matrix = core.reshape((r_left * n, r_right))
 
-        U, S, Vt = backend.svd(matrix, full_matrices=False)
-        rank = _numerical_rank(S)
-        rank = min(rank, S.shape[0])
+        Q, R = backend.qr(matrix)
 
-        U_trunc = _truncate_columns(U, rank, backend)
-        S_trunc = _truncate_vector(S, rank, backend)
-        Vt_trunc = _truncate_rows(Vt, rank, backend)
-
-        cores[k] = U_trunc.reshape((r_left, n, rank))
-
-        transfer = _multiply_diag_matrix(S_trunc, Vt_trunc, rank, backend)
+        cores[k] = Q.reshape((r_left, n, r_right))
 
         next_core = cores[k + 1]
         _, n_next, r_next = next_core.shape
-        new_next = backend.zeros((rank, n_next, r_next))
+
+        new_next = backend.zeros((r_right, n_next, r_next))
 
         for i_next in range(n_next):
             old_slice = backend.zeros((r_right, r_next))
-            for a in range(r_right):
-                for b in range(r_next):
-                    old_slice[a, b] = next_core[a, i_next, b]
 
-            updated_slice = backend.matmul(transfer, old_slice)
+            for alpha in range(r_right):
+                for beta in range(r_next):
+                    old_slice[alpha, beta] = next_core[alpha, i_next, beta]
 
-            for a in range(rank):
-                for b in range(r_next):
-                    new_next[a, i_next, b] = updated_slice[a, b]
+            updated_slice = backend.matmul(R, old_slice)
+
+            for alpha in range(r_right):
+                for beta in range(r_next):
+                    new_next[alpha, i_next, beta] = updated_slice[alpha, beta]
 
         cores[k + 1] = new_next
 
@@ -62,6 +58,11 @@ def left_canonicalize(tt: TTTensor, backend: BackendInterface) -> TTTensor:
 def right_canonicalize(tt: TTTensor, backend: BackendInterface) -> TTTensor:
     """
     Возвращает TTTensor — новый TT-тензор в право-канонической форме.
+
+    Правая канонизация делается RQ-разложением справа налево.
+    RQ получаем как QR от транспонированной матрицы:
+        A.T = Q_t R_t
+        A   = R_t.T Q_t.T
     """
     if tt.order == 1:
         return tt.copy()
@@ -75,49 +76,55 @@ def right_canonicalize(tt: TTTensor, backend: BackendInterface) -> TTTensor:
 
         matrix = core.reshape((r_left, n * r_right))
 
-        U, S, Vt = backend.svd(matrix, full_matrices=False)
-        rank = _numerical_rank(S)
-        rank = min(rank, S.shape[0])
+        matrix_t = backend.transpose(matrix)
+        Q_t, R_t = backend.qr(matrix_t)
 
-        U_trunc = _truncate_columns(U, rank, backend)
-        S_trunc = _truncate_vector(S, rank, backend)
-        Vt_trunc = _truncate_rows(Vt, rank, backend)
+        Q = backend.transpose(Q_t)
+        R = backend.transpose(R_t)
 
-        cores[k] = Vt_trunc.reshape((rank, n, r_right))
-
-        transfer = _multiply_columns_by_diag(U_trunc, S_trunc, backend)
+        cores[k] = Q.reshape((r_left, n, r_right))
 
         prev_core = cores[k - 1]
         r_prev, n_prev, _ = prev_core.shape
-        new_prev = backend.zeros((r_prev, n_prev, rank))
+
+        new_prev = backend.zeros((r_prev, n_prev, r_left))
 
         for i_prev in range(n_prev):
             old_slice = backend.zeros((r_prev, r_left))
-            for a in range(r_prev):
-                for b in range(r_left):
-                    old_slice[a, b] = prev_core[a, i_prev, b]
 
-            updated_slice = backend.matmul(old_slice, transfer)
+            for alpha in range(r_prev):
+                for beta in range(r_left):
+                    old_slice[alpha, beta] = prev_core[alpha, i_prev, beta]
 
-            for a in range(r_prev):
-                for b in range(rank):
-                    new_prev[a, i_prev, b] = updated_slice[a, b]
+            updated_slice = backend.matmul(old_slice, R)
+
+            for alpha in range(r_prev):
+                for beta in range(r_left):
+                    new_prev[alpha, i_prev, beta] = updated_slice[alpha, beta]
 
         cores[k - 1] = new_prev
 
     return TTTensor(cores)
 
 
+# ════════════════════════════════════════════════
+# Вспомогательные функции
+# Оставлены, чтобы не ломать ожидаемую структуру файла.
+# ════════════════════════════════════════════════
+
 def _numerical_rank(
     S: DenseTensor,
     rel_tol: float = 1e-8,
     abs_tol: float = 1e-12
 ) -> int:
+    """
+    Возвращает числовой ранг матрицы по вектору сингулярных значений.
+    """
     if S.ndim != 1:
         raise ValueError("S должен быть одномерным тензором")
 
     if S.shape[0] == 0:
-        return 0
+        return 1
 
     max_s = max(abs(value) for value in S.data)
     threshold = max(abs_tol, rel_tol * max_s)
@@ -135,12 +142,17 @@ def _truncate_columns(
     rank: int,
     backend: BackendInterface
 ) -> DenseTensor:
+    """
+    Возвращает матрицу, составленную из первых rank столбцов исходной матрицы.
+    """
     if matrix.ndim != 2:
         raise ValueError("matrix должен быть 2D")
-    if rank < 0 or rank > matrix.shape[1]:
+
+    rows, cols = matrix.shape
+
+    if rank < 0 or rank > cols:
         raise ValueError("некорректный rank")
 
-    rows, _ = matrix.shape
     result = backend.zeros((rows, rank))
 
     for i in range(rows):
@@ -155,12 +167,17 @@ def _truncate_rows(
     rank: int,
     backend: BackendInterface
 ) -> DenseTensor:
+    """
+    Возвращает матрицу, составленную из первых rank строк исходной матрицы.
+    """
     if matrix.ndim != 2:
         raise ValueError("matrix должен быть 2D")
-    if rank < 0 or rank > matrix.shape[0]:
+
+    rows, cols = matrix.shape
+
+    if rank < 0 or rank > rows:
         raise ValueError("некорректный rank")
 
-    _, cols = matrix.shape
     result = backend.zeros((rank, cols))
 
     for i in range(rank):
@@ -175,8 +192,12 @@ def _truncate_vector(
     rank: int,
     backend: BackendInterface
 ) -> DenseTensor:
+    """
+    Возвращает вектор, состоящий из первых rank элементов исходного вектора.
+    """
     if vector.ndim != 1:
         raise ValueError("vector должен быть 1D")
+
     if rank < 0 or rank > vector.shape[0]:
         raise ValueError("некорректный rank")
 
@@ -194,18 +215,22 @@ def _multiply_diag_matrix(
     rank: int,
     backend: BackendInterface
 ) -> DenseTensor:
-    if diag_vec.ndim != 1 or matrix.ndim != 2:
-        raise ValueError("ожидались diag_vec 1D и matrix 2D")
-    if diag_vec.shape[0] < rank or matrix.shape[0] < rank:
-        raise ValueError("rank несовместим с размерами")
+    """
+    Возвращает diag(diag_vec) @ matrix.
+    """
+    if diag_vec.ndim != 1:
+        raise ValueError("diag_vec должен быть 1D")
+
+    if matrix.ndim != 2:
+        raise ValueError("matrix должен быть 2D")
 
     _, cols = matrix.shape
+
     result = backend.zeros((rank, cols))
 
     for i in range(rank):
-        scale = diag_vec[i]
         for j in range(cols):
-            result[i, j] = scale * matrix[i, j]
+            result[i, j] = diag_vec[i] * matrix[i, j]
 
     return result
 
@@ -215,12 +240,19 @@ def _multiply_columns_by_diag(
     diag_vec: DenseTensor,
     backend: BackendInterface
 ) -> DenseTensor:
-    if matrix.ndim != 2 or diag_vec.ndim != 1:
-        raise ValueError("ожидались matrix 2D и diag_vec 1D")
+    """
+    Возвращает matrix @ diag(diag_vec).
+    """
+    if matrix.ndim != 2:
+        raise ValueError("matrix должен быть 2D")
+
+    if diag_vec.ndim != 1:
+        raise ValueError("diag_vec должен быть 1D")
 
     rows, cols = matrix.shape
+
     if diag_vec.shape[0] != cols:
-        raise ValueError("длина diag_vec должна совпадать с числом столбцов matrix")
+        raise ValueError("длина diag_vec должна совпадать с числом столбцов")
 
     result = backend.zeros((rows, cols))
 

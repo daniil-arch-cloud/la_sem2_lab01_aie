@@ -74,22 +74,33 @@ class DenseTensor:
 
     @staticmethod
     def from_nested_list(nested: list) -> DenseTensor:
+        """
+        Создаёт тензор из вложенного списка Python.
+        Автоматически определяет shape.
+
+        Args:
+            nested: список или кортеж
+        """
+        def is_sequence(obj) -> bool:
+            return isinstance(obj, (list, tuple))
+
         def infer_shape(obj) -> tuple[int, ...]:
-            if not isinstance(obj, list):
+            if not is_sequence(obj):
                 return ()
 
             if len(obj) == 0:
-                raise ValueError("пустые списки не задают корректный тензор")
+                raise ValueError("пустые списки/кортежи не задают корректный тензор")
 
             first_shape = infer_shape(obj[0])
+
             for item in obj[1:]:
                 if infer_shape(item) != first_shape:
-                    raise ValueError("вложенный список должен быть прямоугольным")
+                    raise ValueError("вложенная структура должна быть прямоугольной")
 
             return (len(obj),) + first_shape
 
         def flatten(obj) -> list[float]:
-            if not isinstance(obj, list):
+            if not is_sequence(obj):
                 return [float(obj)]
 
             result: list[float] = []
@@ -98,8 +109,9 @@ class DenseTensor:
             return result
 
         shape = infer_shape(nested)
+
         if len(shape) == 0:
-            raise ValueError("для скаляра используйте явный конструктор DenseTensor")
+            return DenseTensor((1,), data=[float(nested)])
 
         return DenseTensor(shape, data=flatten(nested))
 
