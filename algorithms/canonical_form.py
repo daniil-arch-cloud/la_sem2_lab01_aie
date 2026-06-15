@@ -59,10 +59,9 @@ def right_canonicalize(tt: TTTensor, backend: BackendInterface) -> TTTensor:
     """
     Возвращает TTTensor — новый TT-тензор в право-канонической форме.
 
-    Правая канонизация делается RQ-разложением справа налево.
-    RQ получаем как QR от транспонированной матрицы:
-        A.T = Q_t R_t
-        A   = R_t.T Q_t.T
+    Обычно используем QR от транспонированной матрицы.
+    Но если после tt_add / tt_hadamard ранги стали слишком большими
+    и thin QR невозможен, используем SVD-fallback.
     """
     if tt.order == 1:
         return tt.copy()
@@ -76,33 +75,75 @@ def right_canonicalize(tt: TTTensor, backend: BackendInterface) -> TTTensor:
 
         matrix = core.reshape((r_left, n * r_right))
 
-        matrix_t = backend.transpose(matrix)
-        Q_t, R_t = backend.qr(matrix_t)
+        # Хотим сделать RQ через QR от transpose(matrix).
+        # transpose(matrix) имеет форму (n * r_right, r_left).
+        # backend.qr требует rows >= cols, то есть n * r_right >= r_left.
+        if n * r_right >= r_left:
+            matrix_t = backend.transpose(matrix)
+            Q_t, R_t = backend.qr(matrix_t)
 
-        Q = backend.transpose(Q_t)
-        R = backend.transpose(R_t)
+            Q = backend.transpose(Q_t)
+            R = backend.transpose(R_t)
 
-        cores[k] = Q.reshape((r_left, n, r_right))
+            cores[k] = Q.reshape((r_left, n, r_right))
 
-        prev_core = cores[k - 1]
-        r_prev, n_prev, _ = prev_core.shape
+            prev_core = cores[k - 1]
+            r_prev, n_prev, _ = prev_core.shape
 
-        new_prev = backend.zeros((r_prev, n_prev, r_left))
+            new_prev = backend.zeros((r_prev, n_prev, r_left))
 
-        for i_prev in range(n_prev):
-            old_slice = backend.zeros((r_prev, r_left))
+            for i_prev in range(n_prev):
+                old_slice = backend.zeros((r_prev, r_left))
 
-            for alpha in range(r_prev):
-                for beta in range(r_left):
-                    old_slice[alpha, beta] = prev_core[alpha, i_prev, beta]
+                for alpha in range(r_prev):
+                    for beta in range(r_left):
+                        old_slice[alpha, beta] = prev_core[alpha, i_prev, beta]
 
-            updated_slice = backend.matmul(old_slice, R)
+                updated_slice = backend.matmul(old_slice, R)
 
-            for alpha in range(r_prev):
-                for beta in range(r_left):
-                    new_prev[alpha, i_prev, beta] = updated_slice[alpha, beta]
+                for alpha in range(r_prev):
+                    for beta in range(r_left):
+                        new_prev[alpha, i_prev, beta] = updated_slice[alpha, beta]
 
-        cores[k - 1] = new_prev
+            cores[k - 1] = new_prev
+
+        else:
+            # SVD-fallback для случая, когда QR невозможен:
+            # matrix = U @ diag(S) @ Vt
+            # правое ортогональное ядро берём из Vt,
+            # а U @ diag(S) поглощаем в предыдущее ядро.
+            U, S, Vt = backend.svd(matrix, full_matrices=False)
+
+            rank = _numerical_rank(S)
+            rank = min(rank, S.shape[0])
+
+            U_trunc = _truncate_columns(U, rank, backend)
+            S_trunc = _truncate_vector(S, rank, backend)
+            Vt_trunc = _truncate_rows(Vt, rank, backend)
+
+            cores[k] = Vt_trunc.reshape((rank, n, r_right))
+
+            transfer = _multiply_columns_by_diag(U_trunc, S_trunc, backend)
+
+            prev_core = cores[k - 1]
+            r_prev, n_prev, _ = prev_core.shape
+
+            new_prev = backend.zeros((r_prev, n_prev, rank))
+
+            for i_prev in range(n_prev):
+                old_slice = backend.zeros((r_prev, r_left))
+
+                for alpha in range(r_prev):
+                    for beta in range(r_left):
+                        old_slice[alpha, beta] = prev_core[alpha, i_prev, beta]
+
+                updated_slice = backend.matmul(old_slice, transfer)
+
+                for alpha in range(r_prev):
+                    for beta in range(rank):
+                        new_prev[alpha, i_prev, beta] = updated_slice[alpha, beta]
+
+            cores[k - 1] = new_prev
 
     return TTTensor(cores)
 
